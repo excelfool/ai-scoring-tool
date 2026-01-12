@@ -1,5 +1,5 @@
 import React, { useState, useCallback } from 'react';
-import { Upload, FileSpreadsheet, BarChart3, BookOpen, Download, Plus, Trash2, ChevronDown, ChevronUp, AlertTriangle, HelpCircle } from 'lucide-react';
+import { Upload, FileSpreadsheet, BarChart3, BookOpen, Download, Plus, Trash2, ChevronDown, ChevronUp, AlertTriangle, HelpCircle, Sparkles, Loader2 } from 'lucide-react';
 
 // Comprehensive scoring categories with detailed descriptions and examples
 const SCORING_CATEGORIES = [
@@ -364,14 +364,101 @@ const calculateTotalScore = (scores) => {
   return SCORING_CATEGORIES.reduce((sum, cat) => sum + calculateCategoryTotal(scores, cat), 0);
 };
 
+// AI Scoring function using our serverless backend (calls Claude API securely)
+const getAIScoring = async (project) => {
+  const projectContext = `
+Project Name: ${project.placeholder_project_name || 'Unknown'}
+Owner: ${project.your_name || 'Unknown'}
+Symptoms: ${project.symptoms || 'Not provided'}
+Root Cause: ${project.root_cause || 'Not provided'}
+Core Deficit: ${project.core_deficit || 'Not provided'}
+Problem Statement: ${project.one_line_problem_statement || 'Not provided'}
+Solution Statement: ${project.one_line_solution_statement || 'Not provided'}
+Must Have Features: ${project.must_have || 'Not provided'}
+Should Have Features: ${project.should_have || 'Not provided'}
+Could Have Features: ${project.could_have || 'Not provided'}
+Won't Have Features: ${project.wont_have || 'Not provided'}
+`;
+
+  const rubricContext = SCORING_CATEGORIES.map(cat => 
+    `${cat.name} (${cat.maxPoints} points total):\n` +
+    cat.subcriteria.map(sub => 
+      `  - ${sub.name} (max ${sub.max} points): ${sub.description}\n` +
+      `    Excellent: ${sub.excellent?.example || 'N/A'}\n` +
+      `    Weak: ${sub.weak?.example || 'N/A'}`
+    ).join('\n')
+  ).join('\n\n');
+
+  const allSubcriteria = SCORING_CATEGORIES.flatMap(cat => cat.subcriteria);
+  
+  const prompt = `You are an expert judge for an AI automation MVP competition. Evaluate this project based on the provided rubric.
+
+PROJECT DETAILS:
+${projectContext}
+
+SCORING RUBRIC:
+${rubricContext}
+
+IMPORTANT: Score ONLY based on the information provided. If information is missing for a criterion, give a lower score and note that in your reasoning.
+
+For each of the following ${allSubcriteria.length} criteria, provide a JSON object with:
+- "id": the criterion id
+- "score": integer score (0 to max for that criterion)
+- "reasoning": 1-2 sentence explanation for the score
+
+Respond with a JSON array containing exactly ${allSubcriteria.length} objects, one for each criterion in this exact order:
+${allSubcriteria.map(s => `- ${s.id} (max: ${s.max})`).join('\n')}
+
+Return ONLY the JSON array, no other text.`;
+
+  try {
+    // Call our serverless backend (which securely calls Anthropic)
+    const response = await fetch("/api/ai-score", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ prompt })
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || `Server error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    const content = data.content?.[0]?.text || '';
+    
+    // Extract JSON from response
+    const jsonMatch = content.match(/\[[\s\S]*\]/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      const aiScores = {};
+      const aiReasoning = {};
+      
+      parsed.forEach(item => {
+        if (item.id && typeof item.score === 'number') {
+          aiScores[item.id] = item.score;
+          aiReasoning[item.id] = item.reasoning || '';
+        }
+      });
+      
+      return { aiScores, aiReasoning };
+    }
+    
+    throw new Error('Could not parse AI response');
+  } catch (error) {
+    console.error('AI Scoring error:', error);
+    throw error;
+  }
+};
+
 // PROPER CSV Parser that handles multi-line quoted fields
 const parseCSV = (text) => {
-  // Remove BOM if present
   if (text.charCodeAt(0) === 0xFEFF) {
     text = text.slice(1);
   }
   
-  // Parse CSV properly handling multi-line quoted fields
   const parseCSVToRows = (csvText) => {
     const rows = [];
     let currentRow = [];
@@ -385,11 +472,9 @@ const parseCSV = (text) => {
       if (inQuotes) {
         if (char === '"') {
           if (nextChar === '"') {
-            // Escaped quote
             currentField += '"';
-            i++; // Skip next quote
+            i++;
           } else {
-            // End of quoted field
             inQuotes = false;
           }
         } else {
@@ -408,14 +493,13 @@ const parseCSV = (text) => {
           }
           currentRow = [];
           currentField = '';
-          if (char === '\r') i++; // Skip \n after \r
+          if (char === '\r') i++;
         } else if (char !== '\r') {
           currentField += char;
         }
       }
     }
     
-    // Don't forget the last field/row
     if (currentField || currentRow.length > 0) {
       currentRow.push(currentField.trim());
       if (currentRow.some(field => field !== '')) {
@@ -427,18 +511,9 @@ const parseCSV = (text) => {
   };
   
   const rows = parseCSVToRows(text);
-  console.log('Total rows parsed:', rows.length);
-  
   if (rows.length < 2) return [];
   
-  // First row is headers
   const headers = rows[0];
-  console.log('Headers found:', headers);
-  
-  // Map header indices
-  // Expected: No, Your Name, Placeholder Project Name, Symptom(s), Root Cause, Core Deficit, 
-  //           One-Line Problem Statement, One-Line Solution Statement, Must Have (1-2), 
-  //           Should Have, Could Have, Won't Have
   const headerIndex = {};
   headers.forEach((header, idx) => {
     const h = header.toLowerCase().trim();
@@ -456,27 +531,22 @@ const parseCSV = (text) => {
     else if (h === "won't have" || h === 'wont have') headerIndex.wontHave = idx;
   });
   
-  console.log('Header index mapping:', headerIndex);
-  
-  // Parse data rows
   const projects = [];
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
-    
-    // Check if this row has a project number in the first column
     const noIdx = headerIndex.no !== undefined ? headerIndex.no : 0;
     const projectNum = row[noIdx];
     
-    // Skip rows without a valid project number
-    if (!projectNum || !/^\d+$/.test(projectNum.trim())) {
-      continue;
-    }
+    if (!projectNum || !/^\d+$/.test(projectNum.trim())) continue;
     
     const project = {
       id: `project-${Date.now()}-${i}`,
       project_number: parseInt(projectNum.trim()),
       scores: {},
       notes: {},
+      aiScores: {},
+      aiReasoning: {},
+      aiScoringStatus: 'idle',
       your_name: headerIndex.yourName !== undefined ? (row[headerIndex.yourName] || '') : '',
       placeholder_project_name: headerIndex.projectName !== undefined ? (row[headerIndex.projectName] || '') : '',
       symptoms: headerIndex.symptoms !== undefined ? (row[headerIndex.symptoms] || '') : '',
@@ -490,15 +560,12 @@ const parseCSV = (text) => {
       wont_have: headerIndex.wontHave !== undefined ? (row[headerIndex.wontHave] || '') : ''
     };
     
-    // Only add if we have at least a name
     if (project.placeholder_project_name || project.your_name) {
       projects.push(project);
-      console.log(`Parsed project ${project.project_number}: ${project.placeholder_project_name}`);
     }
   }
   
   projects.sort((a, b) => a.project_number - b.project_number);
-  console.log('Final projects:', projects);
   return projects;
 };
 
@@ -512,25 +579,74 @@ const TabButton = ({ active, onClick, icon: Icon, label }) => (
   </button>
 );
 
-const ScoreInput = ({ value, max, onChange, subcriterion }) => {
+// Manual Score Input Component
+const ManualScoreInput = ({ value, max, onChange }) => {
   const percentage = (value / max) * 100;
   const bgColor = percentage >= 80 ? 'bg-green-500' : percentage >= 60 ? 'bg-blue-500' : percentage >= 40 ? 'bg-yellow-500' : 'bg-red-500';
+  
+  return (
+    <div className="flex items-center gap-3">
+      <div className="flex-1">
+        <input type="range" min="0" max={max} value={value} onChange={(e) => onChange(parseInt(e.target.value))}
+          className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer" />
+        <div className="flex justify-between text-xs text-gray-400 mt-1"><span>0</span><span>{max}</span></div>
+      </div>
+      <div className={`w-12 h-10 rounded-lg ${bgColor} flex items-center justify-center text-white font-bold`}>{value}</div>
+    </div>
+  );
+};
+
+// AI Score Display Component (read-only)
+const AIScoreDisplay = ({ value, max, reasoning }) => {
+  const percentage = (value / max) * 100;
+  const bgColor = percentage >= 80 ? 'bg-purple-500' : percentage >= 60 ? 'bg-purple-400' : percentage >= 40 ? 'bg-purple-300' : 'bg-purple-200';
+  
+  return (
+    <div className="mt-3 p-3 bg-purple-50 rounded-lg border border-purple-200">
+      <div className="flex items-center gap-2 mb-2">
+        <Sparkles size={16} className="text-purple-600" />
+        <span className="text-sm font-medium text-purple-700">Opus 4.5 AI Score</span>
+      </div>
+      <div className="flex items-center gap-3">
+        <div className="flex-1">
+          <div className="w-full h-2 bg-purple-100 rounded-lg">
+            <div className={`h-2 rounded-lg ${bgColor}`} style={{ width: `${percentage}%` }} />
+          </div>
+          <div className="flex justify-between text-xs text-purple-400 mt-1"><span>0</span><span>{max}</span></div>
+        </div>
+        <div className={`w-12 h-10 rounded-lg ${bgColor} flex items-center justify-center text-white font-bold`}>{value}</div>
+      </div>
+      {reasoning && (
+        <p className="mt-2 text-sm text-purple-700 italic">{reasoning}</p>
+      )}
+    </div>
+  );
+};
+
+// Combined Score Input with Help
+const ScoreInputWithAI = ({ value, max, onChange, subcriterion, aiScore, aiReasoning }) => {
   const [showHelp, setShowHelp] = useState(false);
   
   return (
     <div className="space-y-2">
+      {/* Manual Score */}
       <div className="flex items-center gap-3">
         <div className="flex-1">
-          <input type="range" min="0" max={max} value={value} onChange={(e) => onChange(parseInt(e.target.value))}
-            className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer" />
-          <div className="flex justify-between text-xs text-gray-400 mt-1"><span>0</span><span>{max}</span></div>
+          <div className="text-xs text-gray-500 mb-1">Manual Score</div>
+          <ManualScoreInput value={value} max={max} onChange={onChange} />
         </div>
-        <div className={`w-12 h-10 rounded-lg ${bgColor} flex items-center justify-center text-white font-bold`}>{value}</div>
         <button onClick={() => setShowHelp(!showHelp)}
           className={`p-2 rounded-lg transition ${showHelp ? 'bg-blue-100 text-blue-600' : 'bg-gray-100 text-gray-400 hover:bg-gray-200'}`}>
           <HelpCircle size={16} />
         </button>
       </div>
+      
+      {/* AI Score (if available) */}
+      {aiScore !== undefined && (
+        <AIScoreDisplay value={aiScore} max={max} reasoning={aiReasoning} />
+      )}
+      
+      {/* Help Panel */}
       {showHelp && subcriterion && (
         <div className="p-4 bg-blue-50 rounded-lg border border-blue-200 text-sm space-y-3">
           <p className="text-gray-700">{subcriterion.description}</p>
@@ -591,7 +707,7 @@ const ProjectInputTab = ({ projects, setProjects }) => {
       your_name: '', placeholder_project_name: '', symptoms: '', root_cause: '', core_deficit: '',
       one_line_problem_statement: '', one_line_solution_statement: '',
       must_have: '', should_have: '', could_have: '', wont_have: '',
-      scores: {}, notes: {}
+      scores: {}, notes: {}, aiScores: {}, aiReasoning: {}, aiScoringStatus: 'idle'
     }]);
   };
   
@@ -637,14 +753,13 @@ const ProjectInputTab = ({ projects, setProjects }) => {
   );
 };
 
-// Project Card - Shows all CSV fields
+// Project Card
 const ProjectCard = ({ project, index, onUpdate, onDelete }) => {
   const [expanded, setExpanded] = useState(false);
   const projectName = project.placeholder_project_name || `Project ${index + 1}`;
   const score = calculateTotalScore(project.scores || {});
   const tier = getTier(score);
   
-  // Helper to truncate long text for display
   const truncate = (text, maxLen = 100) => {
     if (!text) return '';
     return text.length > maxLen ? text.substring(0, maxLen) + '...' : text;
@@ -678,7 +793,6 @@ const ProjectCard = ({ project, index, onUpdate, onDelete }) => {
       
       {expanded && (
         <div className="p-4 border-t bg-gray-50 space-y-4">
-          {/* Row 1: Name and Owner */}
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Project Name</label>
@@ -687,81 +801,60 @@ const ProjectCard = ({ project, index, onUpdate, onDelete }) => {
                 className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500" />
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Owner (Your Name)</label>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Owner</label>
               <input type="text" value={project.your_name || ''} 
                 onChange={(e) => onUpdate(project.id, 'your_name', e.target.value)}
                 className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500" />
             </div>
           </div>
-          
-          {/* Row 2: Symptoms */}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Symptom(s)</label>
-            <textarea value={project.symptoms || ''} 
-              onChange={(e) => onUpdate(project.id, 'symptoms', e.target.value)}
+            <textarea value={project.symptoms || ''} onChange={(e) => onUpdate(project.id, 'symptoms', e.target.value)}
               className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 text-sm" rows={3} />
           </div>
-          
-          {/* Row 3: Root Cause and Core Deficit */}
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Root Cause</label>
-              <textarea value={project.root_cause || ''} 
-                onChange={(e) => onUpdate(project.id, 'root_cause', e.target.value)}
+              <textarea value={project.root_cause || ''} onChange={(e) => onUpdate(project.id, 'root_cause', e.target.value)}
                 className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 text-sm" rows={3} />
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Core Deficit</label>
-              <textarea value={project.core_deficit || ''} 
-                onChange={(e) => onUpdate(project.id, 'core_deficit', e.target.value)}
+              <textarea value={project.core_deficit || ''} onChange={(e) => onUpdate(project.id, 'core_deficit', e.target.value)}
                 className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 text-sm" rows={3} />
             </div>
           </div>
-          
-          {/* Row 4: Problem Statement */}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">One-Line Problem Statement</label>
-            <textarea value={project.one_line_problem_statement || ''} 
-              onChange={(e) => onUpdate(project.id, 'one_line_problem_statement', e.target.value)}
+            <textarea value={project.one_line_problem_statement || ''} onChange={(e) => onUpdate(project.id, 'one_line_problem_statement', e.target.value)}
               className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500" rows={3} />
           </div>
-          
-          {/* Row 5: Solution Statement */}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">One-Line Solution Statement</label>
-            <textarea value={project.one_line_solution_statement || ''} 
-              onChange={(e) => onUpdate(project.id, 'one_line_solution_statement', e.target.value)}
+            <textarea value={project.one_line_solution_statement || ''} onChange={(e) => onUpdate(project.id, 'one_line_solution_statement', e.target.value)}
               className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500" rows={3} />
           </div>
-          
-          {/* Row 6: Must Have and Should Have */}
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Must Have (1-2)</label>
-              <textarea value={project.must_have || ''} 
-                onChange={(e) => onUpdate(project.id, 'must_have', e.target.value)}
+              <textarea value={project.must_have || ''} onChange={(e) => onUpdate(project.id, 'must_have', e.target.value)}
                 className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 text-sm" rows={4} />
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Should Have</label>
-              <textarea value={project.should_have || ''} 
-                onChange={(e) => onUpdate(project.id, 'should_have', e.target.value)}
+              <textarea value={project.should_have || ''} onChange={(e) => onUpdate(project.id, 'should_have', e.target.value)}
                 className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 text-sm" rows={4} />
             </div>
           </div>
-          
-          {/* Row 7: Could Have and Won't Have */}
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Could Have</label>
-              <textarea value={project.could_have || ''} 
-                onChange={(e) => onUpdate(project.id, 'could_have', e.target.value)}
+              <textarea value={project.could_have || ''} onChange={(e) => onUpdate(project.id, 'could_have', e.target.value)}
                 className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 text-sm" rows={4} />
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Won't Have</label>
-              <textarea value={project.wont_have || ''} 
-                onChange={(e) => onUpdate(project.id, 'wont_have', e.target.value)}
+              <textarea value={project.wont_have || ''} onChange={(e) => onUpdate(project.id, 'wont_have', e.target.value)}
                 className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 text-sm" rows={4} />
             </div>
           </div>
@@ -771,12 +864,14 @@ const ProjectCard = ({ project, index, onUpdate, onDelete }) => {
   );
 };
 
-// Scoring Tab
+// Scoring Tab with AI Integration
 const ScoringTab = ({ projects, setProjects }) => {
   const [selectedProject, setSelectedProject] = useState(projects[0]?.id || null);
   const [expandedCategories, setExpandedCategories] = useState(
     SCORING_CATEGORIES.reduce((acc, cat) => ({ ...acc, [cat.id]: true }), {})
   );
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState(null);
   
   const project = projects.find(p => p.id === selectedProject);
   
@@ -785,6 +880,37 @@ const ScoringTab = ({ projects, setProjects }) => {
     setProjects(projects.map(p => 
       p.id === selectedProject ? { ...p, scores: { ...p.scores, [subcriterionId]: value } } : p
     ));
+  };
+  
+  const runAIScoring = async () => {
+    if (!project) return;
+    
+    setAiLoading(true);
+    setAiError(null);
+    
+    setProjects(projects.map(p => 
+      p.id === selectedProject ? { ...p, aiScoringStatus: 'loading' } : p
+    ));
+    
+    try {
+      const result = await getAIScoring(project);
+      
+      setProjects(projects.map(p => 
+        p.id === selectedProject ? { 
+          ...p, 
+          aiScores: result.aiScores,
+          aiReasoning: result.aiReasoning,
+          aiScoringStatus: 'done'
+        } : p
+      ));
+    } catch (error) {
+      setAiError(error.message || 'Failed to get AI scoring');
+      setProjects(projects.map(p => 
+        p.id === selectedProject ? { ...p, aiScoringStatus: 'error' } : p
+      ));
+    } finally {
+      setAiLoading(false);
+    }
   };
   
   if (projects.length === 0) {
@@ -798,8 +924,12 @@ const ScoringTab = ({ projects, setProjects }) => {
   }
   
   const scores = project?.scores || {};
+  const aiScores = project?.aiScores || {};
+  const aiReasoning = project?.aiReasoning || {};
   const totalScore = calculateTotalScore(scores);
+  const aiTotalScore = calculateTotalScore(aiScores);
   const tier = getTier(totalScore);
+  const aiTier = getTier(aiTotalScore);
   
   return (
     <div className="flex gap-6">
@@ -809,14 +939,24 @@ const ScoringTab = ({ projects, setProjects }) => {
         <div className="space-y-2 max-h-[calc(100vh-250px)] overflow-y-auto">
           {projects.map((p, idx) => {
             const pScore = calculateTotalScore(p.scores || {});
+            const pAiScore = calculateTotalScore(p.aiScores || {});
             const pTier = getTier(pScore);
             return (
               <button key={p.id} onClick={() => setSelectedProject(p.id)}
                 className={`w-full text-left p-3 rounded-lg border transition ${selectedProject === p.id ? 'border-blue-500 bg-blue-50' : 'border-gray-200 hover:border-gray-300'}`}>
                 <div className="font-medium text-gray-800 truncate text-sm">{p.placeholder_project_name || `Project ${idx + 1}`}</div>
                 <div className="text-xs text-gray-500 truncate">{p.your_name || 'Unknown'}</div>
-                <div className="flex items-center justify-between mt-1">
-                  <span className="text-sm font-bold text-gray-700">{pScore}/100</span>
+                <div className="flex items-center justify-between mt-1 gap-2">
+                  <div className="flex items-center gap-1">
+                    <span className="text-sm font-bold text-gray-700">{pScore}</span>
+                    {pAiScore > 0 && (
+                      <>
+                        <span className="text-gray-400">/</span>
+                        <span className="text-sm font-bold text-purple-600">{pAiScore}</span>
+                        <Sparkles size={12} className="text-purple-500" />
+                      </>
+                    )}
+                  </div>
                   <span className={`text-xs px-2 py-0.5 rounded ${pTier.color} text-white`}>{pTier.label.split(' ')[0]}</span>
                 </div>
               </button>
@@ -835,9 +975,50 @@ const ScoringTab = ({ projects, setProjects }) => {
               <p className="text-gray-600">by {project?.your_name || 'Unknown'}</p>
             </div>
             <div className="text-right">
-              <div className="text-4xl font-bold text-gray-800">{totalScore}<span className="text-xl text-gray-500">/100</span></div>
-              <div className={`inline-block px-3 py-1 rounded-full ${tier.color} text-white font-medium mt-1`}>{tier.label}</div>
+              <div className="flex items-center gap-4">
+                <div>
+                  <div className="text-xs text-gray-500 mb-1">Manual</div>
+                  <div className="text-3xl font-bold text-gray-800">{totalScore}<span className="text-lg text-gray-500">/100</span></div>
+                  <div className={`inline-block px-2 py-0.5 rounded ${tier.color} text-white text-xs font-medium mt-1`}>{tier.label}</div>
+                </div>
+                {aiTotalScore > 0 && (
+                  <div className="border-l pl-4 border-gray-300">
+                    <div className="text-xs text-purple-600 mb-1 flex items-center gap-1">
+                      <Sparkles size={12} /> AI
+                    </div>
+                    <div className="text-3xl font-bold text-purple-700">{aiTotalScore}<span className="text-lg text-purple-400">/100</span></div>
+                    <div className={`inline-block px-2 py-0.5 rounded ${aiTier.color} text-white text-xs font-medium mt-1`}>{aiTier.label}</div>
+                  </div>
+                )}
+              </div>
             </div>
+          </div>
+          
+          <div className="mt-4 pt-4 border-t border-gray-200">
+            <button 
+              onClick={runAIScoring}
+              disabled={aiLoading}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition ${
+                aiLoading 
+                  ? 'bg-purple-200 text-purple-400 cursor-not-allowed' 
+                  : 'bg-purple-600 text-white hover:bg-purple-700'
+              }`}
+            >
+              {aiLoading ? (
+                <>
+                  <Loader2 size={18} className="animate-spin" />
+                  Analyzing with Opus 4.5...
+                </>
+              ) : (
+                <>
+                  <Sparkles size={18} />
+                  {Object.keys(aiScores).length > 0 ? 'Re-run AI Scoring' : 'Get AI Scoring'}
+                </>
+              )}
+            </button>
+            {aiError && (
+              <p className="mt-2 text-sm text-red-600">{aiError}</p>
+            )}
           </div>
         </div>
         
@@ -848,7 +1029,6 @@ const ScoringTab = ({ projects, setProjects }) => {
             <div className="space-y-2 text-sm">
               {project.symptoms && <div><span className="font-medium text-gray-600">Symptoms:</span> <span className="text-gray-700">{project.symptoms.substring(0, 300)}{project.symptoms.length > 300 ? '...' : ''}</span></div>}
               {project.root_cause && <div><span className="font-medium text-gray-600">Root Cause:</span> <span className="text-gray-700">{project.root_cause.substring(0, 300)}{project.root_cause.length > 300 ? '...' : ''}</span></div>}
-              {project.core_deficit && <div><span className="font-medium text-gray-600">Core Deficit:</span> <span className="text-gray-700">{project.core_deficit.substring(0, 300)}{project.core_deficit.length > 300 ? '...' : ''}</span></div>}
               {project.one_line_problem_statement && <div><span className="font-medium text-gray-600">Problem:</span> <span className="text-gray-700">{project.one_line_problem_statement.substring(0, 300)}{project.one_line_problem_statement.length > 300 ? '...' : ''}</span></div>}
               {project.one_line_solution_statement && <div><span className="font-medium text-gray-600">Solution:</span> <span className="text-gray-700">{project.one_line_solution_statement.substring(0, 300)}{project.one_line_solution_statement.length > 300 ? '...' : ''}</span></div>}
             </div>
@@ -859,6 +1039,7 @@ const ScoringTab = ({ projects, setProjects }) => {
         <div className="space-y-3">
           {SCORING_CATEGORIES.map(category => {
             const catTotal = calculateCategoryTotal(scores, category);
+            const catAiTotal = calculateCategoryTotal(aiScores, category);
             const catPercentage = (catTotal / category.maxPoints) * 100;
             const isExpanded = expandedCategories[category.id];
             
@@ -868,11 +1049,18 @@ const ScoringTab = ({ projects, setProjects }) => {
                   className="w-full flex items-center justify-between p-4 hover:bg-gray-50 transition">
                   <span className="font-semibold text-gray-800">{category.name}</span>
                   <div className="flex items-center gap-4">
-                    <div className="w-32 bg-gray-200 rounded-full h-2.5">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-bold text-gray-700">{catTotal}/{category.maxPoints}</span>
+                      {catAiTotal > 0 && (
+                        <span className="text-sm font-bold text-purple-600 flex items-center gap-1">
+                          <Sparkles size={12} />{catAiTotal}
+                        </span>
+                      )}
+                    </div>
+                    <div className="w-24 bg-gray-200 rounded-full h-2.5">
                       <div className={`h-2.5 rounded-full ${catPercentage >= 80 ? 'bg-green-500' : catPercentage >= 60 ? 'bg-blue-500' : catPercentage >= 40 ? 'bg-yellow-500' : 'bg-red-500'}`}
                         style={{ width: `${catPercentage}%` }} />
                     </div>
-                    <span className="font-bold text-gray-700 w-16 text-right">{catTotal}/{category.maxPoints}</span>
                     {isExpanded ? <ChevronUp size={20} /> : <ChevronDown size={20} />}
                   </div>
                 </button>
@@ -891,7 +1079,14 @@ const ScoringTab = ({ projects, setProjects }) => {
                           <span className="text-sm text-gray-500">Max: {sub.max} pts</span>
                         </div>
                         <p className="text-xs text-gray-500 mb-3 italic">{sub.hint}</p>
-                        <ScoreInput value={scores[sub.id] || 0} max={sub.max} onChange={(val) => updateScore(sub.id, val)} subcriterion={sub} />
+                        <ScoreInputWithAI 
+                          value={scores[sub.id] || 0} 
+                          max={sub.max} 
+                          onChange={(val) => updateScore(sub.id, val)} 
+                          subcriterion={sub}
+                          aiScore={aiScores[sub.id]}
+                          aiReasoning={aiReasoning[sub.id]}
+                        />
                       </div>
                     ))}
                   </div>
@@ -905,7 +1100,7 @@ const ScoringTab = ({ projects, setProjects }) => {
   );
 };
 
-// Comparison Tab
+// Comparison Tab with AI Scores
 const ComparisonTab = ({ projects }) => {
   if (projects.length === 0) {
     return (
@@ -920,16 +1115,54 @@ const ComparisonTab = ({ projects }) => {
   const projectsWithScores = projects.map((p, idx) => ({
     ...p,
     totalScore: calculateTotalScore(p.scores || {}),
-    categoryScores: SCORING_CATEGORIES.map(cat => ({ ...cat, score: calculateCategoryTotal(p.scores || {}, cat) })),
+    aiTotalScore: calculateTotalScore(p.aiScores || {}),
+    categoryScores: SCORING_CATEGORIES.map(cat => ({ 
+      ...cat, 
+      score: calculateCategoryTotal(p.scores || {}, cat),
+      aiScore: calculateCategoryTotal(p.aiScores || {}, cat)
+    })),
     name: p.placeholder_project_name || `Project ${idx + 1}`
   })).sort((a, b) => b.totalScore - a.totalScore);
   
   const exportToCSV = () => {
-    const headers = ['Rank', 'Project', 'Owner', 'Score', 'Tier', ...SCORING_CATEGORIES.map(c => c.name)];
-    const rows = projectsWithScores.map((p, idx) => [idx + 1, p.name, p.your_name || '', p.totalScore, getTier(p.totalScore).label, ...p.categoryScores.map(c => c.score)]);
-    const csv = [headers, ...rows].map(row => row.map(cell => `"${cell}"`).join(',')).join('\n');
+    const headers = [
+      'Rank', 'Project', 'Owner', 
+      'Manual Score', 'Manual Tier',
+      'AI Score', 'AI Tier',
+      ...SCORING_CATEGORIES.flatMap(c => [`${c.name} (Manual)`, `${c.name} (AI)`])
+    ];
+    
+    const reasoningHeaders = SCORING_CATEGORIES.flatMap(cat => 
+      cat.subcriteria.map(sub => `AI Reasoning: ${sub.name}`)
+    );
+    
+    const allHeaders = [...headers, ...reasoningHeaders];
+    
+    const rows = projectsWithScores.map((p, idx) => {
+      const baseRow = [
+        idx + 1, 
+        p.name, 
+        p.your_name || '',
+        p.totalScore, 
+        getTier(p.totalScore).label,
+        p.aiTotalScore,
+        p.aiTotalScore > 0 ? getTier(p.aiTotalScore).label : 'Not Scored',
+        ...p.categoryScores.flatMap(c => [c.score, c.aiScore || 0])
+      ];
+      
+      const reasoningRow = SCORING_CATEGORIES.flatMap(cat => 
+        cat.subcriteria.map(sub => (p.aiReasoning?.[sub.id] || '').replace(/"/g, '""'))
+      );
+      
+      return [...baseRow, ...reasoningRow];
+    });
+    
+    const csv = [allHeaders, ...rows].map(row => row.map(cell => `"${cell}"`).join(',')).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
-    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'project_rankings.csv'; a.click();
+    const a = document.createElement('a'); 
+    a.href = URL.createObjectURL(blob); 
+    a.download = 'project_rankings_with_ai.csv'; 
+    a.click();
   };
   
   return (
@@ -937,29 +1170,52 @@ const ComparisonTab = ({ projects }) => {
       <div className="flex justify-between items-center">
         <h3 className="text-xl font-semibold text-gray-800">Project Rankings</h3>
         <button onClick={exportToCSV} className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700">
-          <Download size={18} /> Export to CSV
+          <Download size={18} /> Export to CSV (with AI Reasoning)
         </button>
+      </div>
+      
+      <div className="flex items-center gap-6 text-sm">
+        <div className="flex items-center gap-2">
+          <div className="w-4 h-4 bg-gray-700 rounded"></div>
+          <span className="text-gray-600">Manual Score</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="w-4 h-4 bg-purple-600 rounded"></div>
+          <span className="text-gray-600">AI Score (Opus 4.5)</span>
+        </div>
       </div>
       
       <div className="grid gap-4">
         {projectsWithScores.map((project, idx) => {
           const tier = getTier(project.totalScore);
+          const aiTier = project.aiTotalScore > 0 ? getTier(project.aiTotalScore) : null;
           return (
             <div key={project.id} className={`p-4 rounded-xl border-2 overflow-hidden ${idx === 0 ? 'border-yellow-400 bg-yellow-50' : idx === 1 ? 'border-gray-300 bg-gray-50' : idx === 2 ? 'border-orange-300 bg-orange-50' : 'border-gray-200 bg-white'}`}>
               <div className="flex flex-wrap items-start gap-4">
-                {/* Rank badge */}
                 <div className={`w-12 h-12 rounded-full flex-shrink-0 flex items-center justify-center text-xl font-bold ${idx === 0 ? 'bg-yellow-400 text-yellow-900' : idx === 1 ? 'bg-gray-300 text-gray-700' : idx === 2 ? 'bg-orange-300 text-orange-800' : 'bg-gray-100 text-gray-600'}`}>
                   #{idx + 1}
                 </div>
-                {/* Project info - takes remaining space and wraps */}
                 <div className="flex-1 min-w-0" style={{ minWidth: '200px' }}>
                   <h4 className="font-semibold text-lg text-gray-800 break-words">{project.name}</h4>
                   <p className="text-sm text-gray-500">by {project.your_name || 'Unknown'}</p>
                 </div>
-                {/* Score - fixed width, doesn't shrink */}
-                <div className="text-center flex-shrink-0 ml-auto">
-                  <div className="text-3xl font-bold text-gray-800">{project.totalScore}</div>
-                  <span className={`text-xs px-2 py-1 rounded ${tier.color} text-white inline-block`}>{tier.label}</span>
+                <div className="flex items-center gap-6 flex-shrink-0 ml-auto">
+                  <div className="text-center">
+                    <div className="text-xs text-gray-500 mb-1">Manual</div>
+                    <div className="text-3xl font-bold text-gray-800">{project.totalScore}</div>
+                    <span className={`text-xs px-2 py-1 rounded ${tier.color} text-white inline-block mt-1`}>{tier.label}</span>
+                  </div>
+                  <div className="text-center border-l pl-6 border-gray-200">
+                    <div className="text-xs text-purple-600 mb-1 flex items-center gap-1 justify-center">
+                      <Sparkles size={12} /> AI
+                    </div>
+                    <div className="text-3xl font-bold text-purple-700">{project.aiTotalScore || '—'}</div>
+                    {aiTier ? (
+                      <span className={`text-xs px-2 py-1 rounded ${aiTier.color} text-white inline-block mt-1`}>{aiTier.label}</span>
+                    ) : (
+                      <span className="text-xs text-gray-400 inline-block mt-1">Not scored</span>
+                    )}
+                  </div>
                 </div>
               </div>
             </div>
@@ -1094,7 +1350,7 @@ export default function App() {
       </main>
       
       <footer className="bg-gray-800 text-gray-400 py-4 px-4 text-center text-sm">
-        <p>100-Point Scoring System | 8 Categories | 21 Subcriteria</p>
+        <p>100-Point Scoring System | 8 Categories | 21 Subcriteria | Powered by Claude Opus 4.5</p>
       </footer>
     </div>
   );
